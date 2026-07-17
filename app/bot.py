@@ -1,0 +1,722 @@
+import asyncio
+import logging
+import re
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+from app import config
+from app import database
+from app.utils import parse_button_markup, is_user_subscribed
+from thefuzz import process
+
+# Rule-based catalogue (filename parser → auto filters; no LLM)
+try:
+    from app import catalog
+    from app.catalog import config as catalog_cfg
+    CATALOG_AVAILABLE = True
+except Exception as _cat_err:
+    logging.warning("Catalogue module disabled: %s", _cat_err)
+    CATALOG_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=config.BOT_TOKEN)
+dp = Dispatcher()
+
+REQUEST_GROUP_LINK = ""
+
+FILES_GROUP_LINK = ""
+
+async def get_files_link():
+    global FILES_GROUP_LINK
+    if not FILES_GROUP_LINK or FILES_GROUP_LINK == "https://t.me/":
+        try:
+            chat = await bot.get_chat(config.FILES_GROUP_ID)
+            FILES_GROUP_LINK = chat.invite_link
+            if not FILES_GROUP_LINK:
+                FILES_GROUP_LINK = await bot.export_chat_invite_link(config.FILES_GROUP_ID)
+        except Exception as e:
+            print(f"Failed to get files group invite link: {e}")
+            FILES_GROUP_LINK = "https://t.me/"
+    return FILES_GROUP_LINK
+
+async def get_request_link():
+    global REQUEST_GROUP_LINK
+    # Use a hardcoded/static URL from config if provided — avoids needing admin perms
+    if config.REQUEST_GROUP_URL:
+        return config.REQUEST_GROUP_URL
+    if not REQUEST_GROUP_LINK or REQUEST_GROUP_LINK == "https://t.me/":
+        try:
+            chat = await bot.get_chat(config.REQUEST_GROUP_ID)
+            REQUEST_GROUP_LINK = chat.invite_link
+            if not REQUEST_GROUP_LINK:
+                REQUEST_GROUP_LINK = await bot.export_chat_invite_link(config.REQUEST_GROUP_ID)
+        except Exception as e:
+            print(f"Failed to get invite link: {e}")
+            REQUEST_GROUP_LINK = "https://t.me/"
+    return REQUEST_GROUP_LINK
+
+async def ensure_user(user_id: int):
+    await database.add_user(user_id)
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    await ensure_user(user_id)
+    if await database.is_user_banned(user_id):
+        return
+        
+    if not await is_user_subscribed(bot, user_id, config.FILES_GROUP_ID):
+        files_link = await get_files_link()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⛩️ JOIN CHANNEL ⛩️", url=files_link)],
+            [InlineKeyboardButton(text="✅ VERIFY ✅", callback_data="verify_sub")]
+        ])
+        await message.answer(config.START_MSG, reply_markup=keyboard)
+        return
+
+    await message.answer(config.VERIFICATION_SUCCESS_MSG, parse_mode="MarkdownV2")
+    await asyncio.sleep(1)
+    await message.answer(config.ASK_ANIME_MSG)
+
+@dp.callback_query(F.data == "verify_sub")
+async def verify_sub_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if await database.is_user_banned(user_id):
+        await callback.answer("You are banned.", show_alert=True)
+        return
+
+    if await is_user_subscribed(bot, user_id, config.FILES_GROUP_ID):
+        await callback.message.delete()
+        await bot.send_message(chat_id=user_id, text=config.VERIFICATION_SUCCESS_MSG, parse_mode="MarkdownV2")
+        await asyncio.sleep(1)
+        await bot.send_message(chat_id=user_id, text=config.ASK_ANIME_MSG)
+    else:
+        await callback.answer("You haven't joined the channel yet! ❌", show_alert=True)
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if await database.is_user_banned(message.from_user.id): return
+    is_admin = message.from_user.id in config.ADMINS
+    if is_admin:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Stats", callback_data="help:stats"),
+             InlineKeyboardButton(text="📢 Broadcast", callback_data="help:broadcast")],
+            [InlineKeyboardButton(text="🗂 Broadcasts History", callback_data="bcast_list:0")],
+            [InlineKeyboardButton(text="➕ Add Filter", callback_data="help:filter"),
+             InlineKeyboardButton(text="🗑 Delete Filter", callback_data="help:delete")],
+            [InlineKeyboardButton(text="📋 All Filters", callback_data="help:filters"),
+             InlineKeyboardButton(text="🚫 Ban/Unban", callback_data="help:ban")],
+        ])
+        await message.answer("⚙️ *Admin Panel — Select a command:*", parse_mode="Markdown", reply_markup=keyboard)
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 How to Search", callback_data="help:how")],
+            [InlineKeyboardButton(text="📩 Request Anime", url=config.REQUEST_GROUP_URL)],
+        ])
+        await message.answer("👋 *How can I help you?*", parse_mode="Markdown", reply_markup=keyboard)
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    total = await database.get_total_users()
+    await message.answer(f"📊 Total Users: {total}")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    reply = message.reply_to_message
+    if not reply:
+        await message.answer("Please reply to a message to broadcast it.")
+        return
+    broadcast_text = reply.text or reply.caption or "[Media Message]"
+    users = await database.get_all_users()
+    
+    # Save broadcast first to get ID
+    broadcast_id = await database.save_broadcast_and_get_id(broadcast_text, message.from_user.id)
+    
+    success = 0
+    progress_msg = await message.answer(f"⏳ Broadcasting to {len(users)} users...")
+    
+    for uid in users:
+        try:
+            res = await bot.copy_message(chat_id=uid, from_chat_id=reply.chat.id, message_id=reply.message_id)
+            await database.save_sent_broadcast_message(broadcast_id, uid, res.message_id)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    
+    await progress_msg.edit_text(f"✅ Broadcast complete.\nID: #{broadcast_id}\nSuccessful: {success}/{len(users)}")
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    parts = message.text.split()
+    if len(parts) > 1 and parts[1].isdigit():
+        uid = int(parts[1])
+        await database.ban_user(uid, True)
+        await message.answer(f"User {uid} has been banned.")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    parts = message.text.split()
+    if len(parts) > 1 and parts[1].isdigit():
+        uid = int(parts[1])
+        await database.ban_user(uid, False)
+        await message.answer(f"User {uid} has been unbanned.")
+
+# --- Help button callbacks ---
+@dp.callback_query(F.data.startswith("help:"))
+async def cb_help(callback: CallbackQuery):
+    action = callback.data.split(":", 1)[1]
+    is_admin = callback.from_user.id in config.ADMINS
+    tips = {
+        "how": "🔍 *How to Search:*\n\nJust type any Anime name and I'll find it!\nEg: `One Piece`, `Naruto`, `AOT`\n\nMade a typo? I'll still suggest the closest match!",
+        "stats": "📊 Use /stats to see total users.",
+        "broadcast": "📢 Reply to any message with /broadcast to send it to all users.",
+        "filter": "➕ Reply to a sticker with:\n`/filter <Name> [Button](buttonurl:link)`",
+        "delete": "🗑 Use:\n`/delete <Anime Name>`\nto remove a filter.",
+        "filters": "📋 Use /filters to list all registered filters.",
+        "ban": "🚫 Use:\n`/ban <user_id>` or `/unban <user_id>`",
+    }
+    text = tips.get(action, "Unknown action.")
+    await callback.answer()
+    await callback.message.answer(text, parse_mode="Markdown")
+
+# --- Broadcast history pagination ---
+PER_PAGE = 4
+
+def bcast_list_keyboard(broadcasts, page, total):
+    rows = []
+    for b in broadcasts:
+        preview = b[1][:30] + "…" if len(b[1]) > 30 else b[1]
+        rows.append([InlineKeyboardButton(text=f"📨 {preview}", callback_data=f"bcast_view:{b[0]}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅ Prev", callback_data=f"bcast_list:{page-1}"))
+    if (page + 1) * PER_PAGE < total:
+        nav.append(InlineKeyboardButton(text="Next ➡", callback_data=f"bcast_list:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="✖ Close", callback_data="bcast_close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data.startswith("bcast_list:"))
+async def cb_bcast_list(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMINS:
+        await callback.answer("Not authorized.", show_alert=True); return
+    page = int(callback.data.split(":")[1])
+    broadcasts, total = await database.get_broadcasts(page, PER_PAGE)
+    if not broadcasts:
+        await callback.answer("No broadcasts yet.", show_alert=True); return
+    text = f"📂 *Broadcast History* — Page {page+1} of {max(1,(total+PER_PAGE-1)//PER_PAGE)}"
+    await callback.answer()
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=bcast_list_keyboard(broadcasts, page, total))
+    except:
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=bcast_list_keyboard(broadcasts, page, total))
+
+@dp.callback_query(F.data.startswith("bcast_view:"))
+async def cb_bcast_view(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMINS:
+        await callback.answer("Not authorized.", show_alert=True); return
+    bid = int(callback.data.split(":")[1])
+    row = await database.get_broadcast(bid)
+    if not row:
+        await callback.answer("Not found.", show_alert=True); return
+    text = f"📨 *Broadcast #{row[0]}*\n🕐 {row[2]}\n\n{row[1]}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Edit & Resend", callback_data=f"bcast_edit:{bid}"),
+         InlineKeyboardButton(text="🗑 Delete", callback_data=f"bcast_del:{bid}")],
+        [InlineKeyboardButton(text="⬅ Back", callback_data="bcast_list:0")],
+    ])
+    await callback.answer()
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("bcast_del:"))
+async def cb_bcast_del(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMINS:
+        await callback.answer("Not authorized.", show_alert=True); return
+    bid = int(callback.data.split(":")[1])
+    await database.delete_broadcast(bid)
+    await callback.answer("Deleted ✅", show_alert=True)
+    # Refresh list
+    broadcasts, total = await database.get_broadcasts(0, PER_PAGE)
+    if broadcasts:
+        text = "📂 *Broadcast History* — Page 1"
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=bcast_list_keyboard(broadcasts, 0, total))
+    else:
+        await callback.message.edit_text("No broadcasts yet.")
+
+@dp.callback_query(F.data.startswith("bcast_edit:"))
+async def cb_bcast_edit(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMINS:
+        await callback.answer("Not authorized.", show_alert=True); return
+    bid = int(callback.data.split(":")[1])
+    await callback.answer()
+    await callback.message.answer(
+        f"✏️ Reply to this message with the new text to *edit & resend broadcast #{bid}*.\n\nSend: `/bcast_update {bid} <new text>`",
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("bcast_update"))
+async def cmd_bcast_update(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    parts = message.text.split(None, 2)
+    if len(parts) < 3:
+        await message.answer("Usage: `/bcast_update <id> <new text>`", parse_mode="Markdown"); return
+    bid = int(parts[1])
+    new_text = parts[2]
+    await database.update_broadcast(bid, new_text)
+    
+    sent_messages = await database.get_sent_broadcast_messages(bid)
+    if not sent_messages:
+        await message.answer(f"⚠️ No message IDs found for broadcast #{bid}. I can only update the database for this one.")
+        return
+
+    await message.answer(f"🔄 Editing broadcast #{bid} for {len(sent_messages)} users...")
+    
+    success = 0
+    for uid, mid in sent_messages:
+        try:
+            await bot.edit_message_text(chat_id=uid, message_id=mid, text=new_text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            try:
+                # If editing text fails (e.g. it was a media caption), try editing caption
+                await bot.edit_message_caption(chat_id=uid, message_id=mid, caption=new_text)
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                pass
+                
+    await message.answer(f"✅ Finished editing broadcast #{bid}.\nSuccessful Edits: {success}/{len(sent_messages)}")
+
+@dp.callback_query(F.data == "bcast_close")
+async def cb_bcast_close(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.delete()
+
+@dp.message(Command("filter"))
+async def cmd_filter(message: Message):
+    sender_id = message.from_user.id
+    logging.warning(f"[FILTER] sender_id={sender_id}, ADMINS={config.ADMINS}, is_admin={sender_id in config.ADMINS}")
+    if sender_id not in config.ADMINS:
+        await message.answer(f"❌ Not admin. Your ID: `{sender_id}`", parse_mode="Markdown")
+        return
+    
+    # Optional: Still support sticker replies, but don't strictly require it
+    sticker_id = None
+    if message.reply_to_message and message.reply_to_message.sticker:
+        sticker_id = message.reply_to_message.sticker.file_id
+        
+    # Robustly strip the /filter command prefix (handles newlines, spaces, @botname variants)
+    full_text = message.text or message.caption or ""
+    text = re.sub(r'^/filter(?:@\w+)?\s*', '', full_text, count=1).strip()
+    if not text:
+        await message.answer("Usage: `/filter <Anime Name> [Button Text](buttonurl:link)`", parse_mode="Markdown")
+        return
+    
+    # The string might contain newlines!
+    # E.g.
+    # /filter One Piece [✨ GACO ✨]
+    # (buttonurl:link)
+    # So we simply find the FIRST bracket '[' to split Keyword from the rest
+    if "[" not in text:
+        await message.answer("Usage: `/filter <Anime Name> [Button Text](buttonurl:link)`", parse_mode="Markdown")
+        return
+        
+    keyword, reply_data = text.split("[", 1)
+    keyword = keyword.strip()
+    # If the user put a newline between Keyword and '[' or inside `text`, let's strip it from keyword
+    keyword = keyword.split("\n")[0].strip() 
+    
+    reply_data = "[" + reply_data # Re-append the bracket
+    
+    await database.add_filter(keyword, reply_data, sticker_id)
+    if sticker_id:
+        await message.answer(f"✅ Filter added for `{keyword}` with the attached sticker!", parse_mode="Markdown")
+    else:
+        await message.answer(f"✅ Filter added for `{keyword}` (Text only)", parse_mode="Markdown")
+
+@dp.message(Command("filters"))
+async def cmd_filters(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    keywords = await database.get_all_filter_keywords()
+    if not keywords:
+        await message.answer("No filters registered yet.")
+        return
+    lines = [f"• `{kw}`" for kw in sorted(keywords)]
+    await message.answer("📋 *Registered Filters:*\n" + "\n".join(lines), parse_mode="Markdown")
+
+@dp.message(F.sticker)
+async def handle_sticker(message: Message):
+    if message.from_user.id in config.ADMINS:
+        sticker_id = message.sticker.file_id
+        await message.answer(f"Sticker ID:\n`{sticker_id}`", parse_mode="Markdown")
+
+@dp.message(Command("delete"))
+async def cmd_delete(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1:
+        keyword = parts[1]
+        deleted = await database.delete_filter(keyword)
+        if deleted:
+            await message.answer(f"✅ Filter `{keyword}` deleted.")
+        else:
+            await message.answer(f"❌ Filter `{keyword}` not found.")
+
+async def _deliver_filter(target, filter_data, *, chat_id=None):
+    """Send sticker/photo card + GACO/DOWNLOAD buttons (screenshot UX)."""
+    clean_text, markup = parse_button_markup(filter_data["reply_text"])
+    if not clean_text:
+        clean_text = "Here you go!"
+    file_id = filter_data.get("file_id")
+
+    async def _send_sticker(fid):
+        if chat_id is not None:
+            await bot.send_sticker(chat_id=chat_id, sticker=fid, reply_markup=markup)
+        else:
+            await target.answer_sticker(sticker=fid, reply_markup=markup)
+
+    async def _send_photo(fid):
+        if chat_id is not None:
+            await bot.send_photo(chat_id=chat_id, photo=fid, caption=clean_text, reply_markup=markup)
+        else:
+            await target.answer_photo(photo=fid, caption=clean_text, reply_markup=markup)
+
+    async def _send_text():
+        if chat_id is not None:
+            await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=markup)
+        else:
+            await target.answer(clean_text, reply_markup=markup)
+
+    if file_id:
+        try:
+            await _send_sticker(file_id)
+            return
+        except Exception:
+            try:
+                await _send_photo(file_id)
+                return
+            except Exception:
+                pass
+    await _send_text()
+
+
+@dp.callback_query(F.data.startswith("typo_yes:"))
+async def cb_typo_yes(callback: CallbackQuery):
+    if await database.is_user_banned(callback.from_user.id): return
+    keyword = callback.data.split(":", 1)[1]
+    filter_data = await database.get_filter(keyword)
+    if filter_data:
+        await _deliver_filter(callback.message, filter_data, chat_id=callback.from_user.id)
+        await callback.message.delete()
+    else:
+        await callback.answer("An error occurred.", show_alert=True)
+
+@dp.message(Command("catalog"))
+async def cmd_catalog(message: Message):
+    """Admin: catalogue + cover server (topics → stickers → classic filters)."""
+    if message.from_user.id not in config.ADMINS:
+        return
+    if not CATALOG_AVAILABLE:
+        await message.answer("❌ Catalogue module not loaded.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 1:
+        st = await catalog.status()
+        on = "🟢 ON" if st["enabled"] else "🔴 OFF"
+        sess = "🟢 ready" if st.get("session_ready") else "🔴 set TELEGRAM_SESSION"
+        await message.answer(
+            f"📚 *Catalogue / Cover Server*\n"
+            f"Status: {on}\n"
+            f"User session: {sess}\n"
+            f"Indexed files: `{st['indexed']}`\n"
+            f"Parseable: `{st['parseable']}`\n"
+            f"Topics (covers): `{st.get('topics', 0)}`\n"
+            f"Filters: `{st['filters']}`\n"
+            f"Buttons: `{st.get('gaco_button')}` · `{st.get('download_button')}`\n"
+            f"Stickers: `{'on' if st.get('use_stickers') else 'off'}`\n\n"
+            f"Commands:\n"
+            f"`/catalog on` · `/catalog off`\n"
+            f"`/catalog rebuild` — filters from index + topics\n"
+            f"`/catalog backfill` — scan all forum topics (user session)\n"
+            f"`/catalog backfill force` — re-process covers",
+            parse_mode="Markdown",
+        )
+        return
+    arg = parts[1].strip().lower()
+    if arg == "on":
+        catalog_cfg.CATALOG_ENABLED = True
+        await message.answer("✅ Catalogue auto-update enabled.")
+    elif arg == "off":
+        catalog_cfg.CATALOG_ENABLED = False
+        await message.answer("⏹ Catalogue auto-update disabled (indexing still runs).")
+    elif arg == "rebuild":
+        progress = await message.answer("🔄 Rebuilding filters from auto_index + topics…")
+        result = await catalog.rebuild_all_filters()
+        await progress.edit_text(
+            f"✅ Rebuild complete.\n"
+            f"Filters written: *{result['filters']}*\n"
+            f"Index rows: *{result['indexed']}*\n"
+            f"Topics: *{result.get('topics', 0)}*",
+            parse_mode="Markdown",
+        )
+    elif arg in ("backfill", "backfill force") or arg.startswith("backfill"):
+        force = "force" in arg
+        if not catalog_cfg.session_configured():
+            await message.answer(
+                "❌ User session not configured.\n"
+                "1. `python scripts/login_session.py`\n"
+                "2. Put `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION` in env\n"
+                "3. Account must be admin of the files group"
+            )
+            return
+        progress = await message.answer(
+            "🔄 Cover server backfill started…\n"
+            "This can take a while (topics × delay). I'll update when done."
+        )
+
+        async def run_backfill():
+            try:
+                from app.catalog.cover_server import backfill
+                stats = await backfill(
+                    bot,
+                    config.FILES_GROUP_ID,
+                    force=force,
+                    limit=0,
+                )
+                await progress.edit_text(
+                    f"✅ Backfill complete.\n"
+                    f"Topics: *{stats['topics']}*\n"
+                    f"OK: *{stats['ok']}* · Skipped: *{stats['skipped']}*\n"
+                    f"No cover: *{stats['no_cover']}* · Errors: *{stats['errors']}*",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logging.exception("backfill failed")
+                await progress.edit_text(f"❌ Backfill failed: `{e}`", parse_mode="Markdown")
+
+        asyncio.create_task(run_backfill())
+    else:
+        await message.answer(
+            "Usage: `/catalog [on|off|rebuild|backfill|backfill force]`",
+            parse_mode="Markdown",
+        )
+
+
+@dp.callback_query(F.data == "typo_no")
+async def cb_typo_no(callback: CallbackQuery):
+    if await database.is_user_banned(callback.from_user.id): return
+    req_link = await get_request_link()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Request Group", url=req_link)
+    ]])
+    await bot.send_message(chat_id=callback.from_user.id, text=config.NOT_FOUND_MSG, reply_markup=keyboard)
+    await callback.message.delete()
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id not in config.ADMINS: return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast_help")],
+        [InlineKeyboardButton(text="🚫 Ban User", callback_data="admin_ban_help"), InlineKeyboardButton(text="✅ Unban", callback_data="admin_unban_help")],
+        [InlineKeyboardButton(text="➕ Add Filter", callback_data="admin_filter_help"), InlineKeyboardButton(text="➖ Delete Filter", callback_data="admin_delete_help")]
+    ])
+    await message.answer("🛠 **Admin Panel**\nWelcome! Please select an option below:", parse_mode="Markdown", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("admin_"))
+async def cb_admin(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMINS: return
+    action = callback.data.split("_", 1)[1]
+    
+    back_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]])
+
+    if action == "stats":
+        total = await database.get_total_users()
+        await callback.answer(f"📊 Total Users: {total}", show_alert=True)
+    elif action == "broadcast_help":
+        await callback.message.edit_text("To broadcast, simply reply to any message with the `/broadcast` command.", reply_markup=back_markup)
+    elif action in ["ban_help", "unban_help"]:
+        cmd = "/ban" if action == "ban_help" else "/unban"
+        await callback.message.edit_text(f"To ban/unban someone, use `{cmd} <user_id>`.", parse_mode="Markdown", reply_markup=back_markup)
+    elif action in ["filter_help", "delete_help"]:
+        cmd = "/filter <Keyword> [Button Text](buttonurl:link)" if action == "filter_help" else "/delete <Keyword>"
+        await callback.message.edit_text(f"To manage filters, use:\n`{cmd}`", parse_mode="Markdown", reply_markup=back_markup)
+    elif action == "back":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast_help")],
+            [InlineKeyboardButton(text="🚫 Ban User", callback_data="admin_ban_help"), InlineKeyboardButton(text="✅ Unban", callback_data="admin_unban_help")],
+            [InlineKeyboardButton(text="➕ Add Filter", callback_data="admin_filter_help"), InlineKeyboardButton(text="➖ Delete Filter", callback_data="admin_delete_help")]
+        ])
+        await callback.message.edit_text("🛠 **Admin Panel**\nWelcome! Please select an option below:", parse_mode="Markdown", reply_markup=keyboard)
+
+@dp.message(F.chat.id.in_([int(config.FILES_GROUP_ID), str(config.FILES_GROUP_ID)]))
+async def index_files_group(message: Message):
+    # Track new forum topics (name → later covers)
+    if getattr(message, "forum_topic_created", None) and CATALOG_AVAILABLE:
+        try:
+            name = message.forum_topic_created.name
+            thread_id = message.message_thread_id
+            if name and thread_id:
+                from app.catalog.parser import normalize_keyword
+                await database.upsert_topic(
+                    thread_id=int(thread_id),
+                    title=name,
+                    keyword=normalize_keyword(name),
+                )
+        except Exception as e:
+            logging.warning("topic create index failed: %s", e)
+
+    chat_id_str = str(message.chat.id).replace("-100", "")
+    if message.chat.username:
+        message_url = f"https://t.me/{message.chat.username}/{message.message_id}"
+    else:
+        message_url = f"https://t.me/c/{chat_id_str}/{message.message_id}"
+
+    # Cover photo in a topic → Cover Server (bot path, no Telethon)
+    if (
+        CATALOG_AVAILABLE
+        and catalog_cfg.CATALOG_ENABLED
+        and message.photo
+        and message.message_thread_id
+    ):
+        asyncio.create_task(_live_cover_from_message(message, message_url))
+
+    if message.video or message.document:
+        file_name = message.video.file_name if message.video else message.document.file_name
+        caption = message.caption or ""
+        await database.add_auto_index(message.message_id, file_name or "", caption, message_url)
+
+        if CATALOG_AVAILABLE and catalog_cfg.CATALOG_ENABLED:
+            asyncio.create_task(
+                catalog.refresh_series_filter(file_name or "", caption, message_url)
+            )
+
+
+async def _live_cover_from_message(message: Message, message_url: str):
+    """If this topic has no sticker yet, treat photo as cover."""
+    try:
+        from app.catalog.cover_server import ingest_live_cover
+        from app.catalog.parser import normalize_keyword
+
+        thread_id = int(message.message_thread_id)
+        existing = await database.get_topic(thread_id)
+        if existing and existing.get("sticker_file_id"):
+            return
+
+        title = (existing or {}).get("title")
+        if not title and message.caption:
+            title = message.caption.splitlines()[0].strip()[:120]
+        if not title:
+            title = f"Topic {thread_id}"
+
+        # Download largest photo
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        buf = await bot.download_file(file.file_path)
+        if hasattr(buf, "read"):
+            image_bytes = buf.read()
+        elif isinstance(buf, (bytes, bytearray)):
+            image_bytes = bytes(buf)
+        else:
+            image_bytes = bytes(buf.getvalue()) if hasattr(buf, "getvalue") else None
+        if not image_bytes:
+            return
+
+        await ingest_live_cover(
+            bot,
+            thread_id=thread_id,
+            title=title,
+            message_id=message.message_id,
+            chat_id=message.chat.id,
+            image_bytes=image_bytes,
+            caption=message.caption or "",
+            username=message.chat.username,
+        )
+    except Exception as e:
+        logging.warning("live cover failed: %s", e)
+
+@dp.message()
+async def search_anime(message: Message):
+    if message.chat.type != "private": return
+    user_id = message.from_user.id
+    if not message.text or message.text.startswith("/"): return
+    await ensure_user(user_id)
+    if await database.is_user_banned(user_id): return
+    
+    # Log regular message activity (only for users)
+    await database.log_activity(user_id, 'message')
+        
+    if not await is_user_subscribed(bot, user_id, config.FILES_GROUP_ID):
+        files_link = await get_files_link()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⛩️ JOIN CHANNEL ⛩️", url=files_link)],
+            [InlineKeyboardButton(text="✅ VERIFY ✅", callback_data="verify_sub")]
+        ])
+        await message.answer(config.START_MSG, reply_markup=keyboard)
+        return
+
+    query = message.text.strip().lower()
+    reply_data = await database.get_filter(query)
+    
+    if reply_data:
+        await _deliver_filter(message, reply_data)
+        await database.log_activity(user_id, 'filter')
+        return
+        
+    all_keywords = await database.get_all_filter_keywords()
+    # Ignore junk keywords (e.g. "the", "a") that break typo suggestions
+    all_keywords = [k for k in all_keywords if k and len(k.strip()) >= 3]
+    if all_keywords:
+        match = process.extractOne(query, all_keywords)
+        if match and match[1] >= 70:
+            matched_keyword = match[0]
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="YES", callback_data=f"typo_yes:{matched_keyword}"),
+                    InlineKeyboardButton(text="NO", callback_data="typo_no")
+                ]
+            ])
+            await message.reply(f'Did you mean "{matched_keyword.title()}" ?', reply_markup=keyboard)
+            return
+
+    # THIRD TRY: Auto Indexer
+    auto_results = await database.search_auto_index(query)
+    if auto_results:
+        # We group results by limits of inline buttons (max 5-10 per message or so)
+        keyboard_buttons = []
+        for res in auto_results[:10]: # Limiting to 10 for inline query clean layout
+            btn_text = res['file_name'] or "Video/File"
+            if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
+            keyboard_buttons.append([InlineKeyboardButton(text=f"🎬 {btn_text}", url=res['url'])])
+            
+        if keyboard_buttons:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+            await message.answer(f"✅ Found **{len(auto_results)}** matches in the Auto-Index:", reply_markup=keyboard, parse_mode="Markdown")
+            # Log auto-index match as a filter match
+            await database.log_activity(user_id, 'filter')
+            return
+            
+    req_link = await get_request_link()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Request Group", url=req_link)
+    ]])
+    await message.answer(config.NOT_FOUND_MSG, reply_markup=keyboard)
+
+async def main():
+    await database.init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    asyncio.run(main())
