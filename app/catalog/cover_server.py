@@ -65,23 +65,34 @@ async def _get_telethon_client():
 
 async def list_forum_topics(client, entity) -> list[dict]:
     """Return [{id, title}, ...] for all forum topics."""
-    from telethon.tl.functions.channels import GetForumTopicsRequest
-    from telethon.tl.types import MessageActionTopicCreate
+    from datetime import datetime, timezone
+    # Telethon ≥1.28: GetForumTopicsRequest lives under messages, not channels
+    from telethon.tl.functions.messages import GetForumTopicsRequest
 
     topics: list[dict] = []
     offset_topic = 0
     offset_id = 0
-    offset_date = None
+    offset_date = datetime.fromtimestamp(0, tz=timezone.utc)
+    seen_offsets: set[tuple] = set()
+    max_pages = 200
 
-    while True:
+    for page in range(max_pages):
+        key = (offset_topic, offset_id)
+        if key in seen_offsets:
+            logger.warning("Forum topic pagination stuck at %s — stopping", key)
+            break
+        seen_offsets.add(key)
+
         result = await client(GetForumTopicsRequest(
-            channel=entity,
+            peer=entity,
             offset_date=offset_date,
             offset_id=offset_id,
             offset_topic=offset_topic,
             limit=100,
+            q="",
         ))
         batch = list(getattr(result, "topics", []) or [])
+        logger.info("Forum topics page %s: %s items (total so far %s)", page + 1, len(batch), len(topics) + len(batch))
         if not batch:
             break
         for t in batch:
@@ -90,18 +101,18 @@ async def list_forum_topics(client, entity) -> list[dict]:
             if tid is None:
                 continue
             topics.append({"id": int(tid), "title": title})
-        # pagination
-        last = batch[-1]
-        offset_topic = getattr(last, "id", offset_topic)
-        offset_id = getattr(last, "top_message", offset_id) or offset_id
         if len(batch) < 100:
             break
-        await asyncio.sleep(0.2)
+        last = batch[-1]
+        offset_topic = int(getattr(last, "id", offset_topic) or offset_topic)
+        offset_id = int(getattr(last, "top_message", offset_id) or offset_id)
+        await asyncio.sleep(0.25)
 
     # Deduplicate by id
     seen = {}
     for t in topics:
         seen[t["id"]] = t
+    logger.info("Forum topics unique: %s", len(seen))
     return list(seen.values())
 
 
@@ -216,9 +227,15 @@ async def backfill(
     }
 
     try:
+        logger.info("Resolving files group %s …", files_group_id)
         entity = await client.get_entity(int(files_group_id))
         username = getattr(entity, "username", None)
         chat_id = int(files_group_id)
+        logger.info(
+            "Group: %s forum=%s",
+            getattr(entity, "title", chat_id),
+            getattr(entity, "forum", None),
+        )
 
         topics = await list_forum_topics(client, entity)
         if limit and limit > 0:
@@ -243,6 +260,8 @@ async def backfill(
                 else:
                     stats["errors"] += 1
                 stats["details"].append(result)
+                if i <= 5 or i % 25 == 0 or not result.get("ok"):
+                    logger.info("[%s/%s] %s → %s", i, len(topics), topic.get("title"), result)
             except Exception as e:
                 logger.exception("topic %s failed: %s", topic, e)
                 stats["errors"] += 1

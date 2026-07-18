@@ -149,11 +149,24 @@ async def rebuild_all_filters() -> dict:
         created += 1
 
     logger.info("Catalogue rebuild: %s filters (index=%s topics=%s)", created, len(rows), len(topics))
+
+    # Season / episode / movie / OVA direct-link filters
+    from app.catalog.granular import apply_granular_filters
+    granular_stats = await apply_granular_filters()
+
+    # Fan short names / official abbreviations → extra filter keys
+    from app.catalog.expand import expand_filter_aliases
+    alias_stats = await expand_filter_aliases()
+
+    all_kw = await database.get_all_filter_keywords()
     return {
-        "filters": created,
+        "filters": len(all_kw),
+        "base_filters": created,
         "indexed": len(rows),
         "topics": len(topics),
-        "keywords": sorted(set(groups) | set(topics)),
+        "granular": granular_stats,
+        "aliases_created": alias_stats.get("created", 0),
+        "keywords": sorted(all_kw)[:50],
     }
 
 

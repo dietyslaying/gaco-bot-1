@@ -1,11 +1,21 @@
 import asyncio
 import logging
+from pathlib import Path
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, BigInteger, Text, select, update, delete, func
-from sqlalchemy.dialects.postgresql import insert
 from app import config
 import redis.asyncio as redis
+
+
+def _dialect_insert():
+    """Postgres or SQLite upsert dialect matching the live engine."""
+    name = engine.dialect.name if engine is not None else "postgresql"
+    if name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    else:
+        from sqlalchemy.dialects.postgresql import insert
+    return insert
 
 Base = declarative_base()
 
@@ -63,27 +73,82 @@ class BroadcastSentMessage(Base):
     user_id = Column(BigInteger, primary_key=True)
     message_id = Column(BigInteger, nullable=False)
 
+
+class SearchHitStat(Base):
+    """Successful searches / requests for titles that exist in the catalogue."""
+    __tablename__ = 'search_hit_stats'
+    query = Column(String, primary_key=True)  # matched keyword / title key
+    count = Column(Integer, default=0)
+    last_at = Column(String, nullable=True)
+
+
+class SearchMissStat(Base):
+    """Searches that did not resolve — most wanted missing titles."""
+    __tablename__ = 'search_miss_stats'
+    query = Column(String, primary_key=True)
+    count = Column(Integer, default=0)
+    last_at = Column(String, nullable=True)
+
+
 # Database Setup
 engine = None
 AsyncSessionLocal = None
 redis_client = None
 
-async def init_db():
-    global engine, AsyncSessionLocal, redis_client
-    
-    db_url = config.DATABASE_URL
+def _normalize_database_url(db_url: str) -> str:
+    """Accept postgres / sqlite URLs (absolute or relative paths for sqlite)."""
     if not db_url:
-        raise ValueError("DATABASE_URL environment variable is not set. Please set it to a valid Postgres URI.")
+        raise ValueError(
+            "DATABASE_URL is not set. Example: "
+            "sqlite+aiosqlite:///./backups/railway_backup.sqlite "
+            "or postgresql://user:pass@localhost:5432/gaco"
+        )
+    # Plain path → sqlite
+    if db_url.endswith(".sqlite") or db_url.endswith(".db") or db_url.endswith(".sqlite3"):
+        if not db_url.startswith("sqlite"):
+            p = Path(db_url).expanduser()
+            if not p.is_absolute():
+                p = (Path(__file__).resolve().parents[1] / p).resolve()
+            db_url = f"sqlite+aiosqlite:///{p.as_posix()}"
     if db_url.startswith("postgresql://"):
         db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif db_url.startswith("sqlite:///") and not db_url.startswith("sqlite+aiosqlite:///"):
+        db_url = db_url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
+    # Relative sqlite+aiosqlite paths → absolute under project root
+    if db_url.startswith("sqlite+aiosqlite:///"):
+        rest = db_url[len("sqlite+aiosqlite:///"):]
+        # Windows absolute: /C:/... or C:/...
+        if rest and not rest.startswith("/") and not (len(rest) > 1 and rest[1] == ":"):
+            # relative path
+            p = (Path(__file__).resolve().parents[1] / rest).resolve()
+            db_url = f"sqlite+aiosqlite:///{p.as_posix()}"
+        elif rest.startswith("./") or rest.startswith(".\\"):
+            p = (Path(__file__).resolve().parents[1] / rest[2:]).resolve()
+            db_url = f"sqlite+aiosqlite:///{p.as_posix()}"
+    return db_url
+
+
+async def init_db():
+    global engine, AsyncSessionLocal, redis_client
+
+    db_url = _normalize_database_url(config.DATABASE_URL)
+    logging.info("Database URL dialect ready: %s", db_url.split("://")[0])
 
     from sqlalchemy.pool import NullPool
-    engine = create_async_engine(db_url, echo=False, poolclass=NullPool)
+    connect_args = {}
+    if db_url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+
+    engine = create_async_engine(
+        db_url, echo=False, poolclass=NullPool, connect_args=connect_args
+    )
     AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
+
     if config.REDIS_URL:
         redis_client = redis.from_url(config.REDIS_URL, decode_responses=True)
         logging.info("Connected to Redis")
@@ -94,6 +159,7 @@ async def get_session():
 
 # User Management
 async def add_user(user_id: int):
+    insert = _dialect_insert()
     async with AsyncSessionLocal() as session:
         async with session.begin():
             stmt = insert(User).values(user_id=user_id).on_conflict_do_nothing()
@@ -131,18 +197,14 @@ async def add_filter(keyword: str, reply_text: str, file_id: str = None, keep_ex
         if existing and existing.get("file_id"):
             file_id = existing["file_id"]
 
+    insert = _dialect_insert()
     async with AsyncSessionLocal() as session:
         async with session.begin():
             stmt = insert(Filter).values(keyword=keyword, reply_text=reply_text, file_id=file_id)
-            if engine.dialect.name == 'postgresql':
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['keyword'],
-                    set_=dict(reply_text=reply_text, file_id=file_id)
-                )
-            else:
-                # SQLite fallback
-                await session.execute(delete(Filter).where(Filter.keyword == keyword))
-                stmt = insert(Filter).values(keyword=keyword, reply_text=reply_text, file_id=file_id)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['keyword'],
+                set_=dict(reply_text=reply_text, file_id=file_id),
+            )
             await session.execute(stmt)
     
     if redis_client:
@@ -204,9 +266,120 @@ async def log_activity(user_id: int, type: str):
 async def get_leaderboard(limit=10):
     async with AsyncSessionLocal() as session:
         res = await session.execute(
-            select(UserActivity).order_by((UserActivity.messages_count + UserActivity.filters_asked_count).desc()).limit(limit)
+            select(UserActivity).order_by(
+                (UserActivity.messages_count + UserActivity.filters_asked_count).desc()
+            ).limit(limit)
         )
         return res.scalars().all()
+
+
+def _now_str() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+async def log_search_hit(query: str):
+    """Record a successful catalogue hit (real-time most requested)."""
+    q = (query or "").strip().lower()[:200]
+    if not q:
+        return
+    insert = _dialect_insert()
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            # ensure row exists
+            await session.execute(
+                insert(SearchHitStat).values(query=q, count=0, last_at=_now_str()).on_conflict_do_nothing()
+            )
+            await session.execute(
+                update(SearchHitStat)
+                .where(SearchHitStat.query == q)
+                .values(count=SearchHitStat.count + 1, last_at=_now_str())
+            )
+
+
+async def log_search_miss(query: str):
+    """Record a miss — title users want that isn't available."""
+    q = (query or "").strip().lower()[:200]
+    if not q or len(q) < 2:
+        return
+    insert = _dialect_insert()
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            await session.execute(
+                insert(SearchMissStat).values(query=q, count=0, last_at=_now_str()).on_conflict_do_nothing()
+            )
+            await session.execute(
+                update(SearchMissStat)
+                .where(SearchMissStat.query == q)
+                .values(count=SearchMissStat.count + 1, last_at=_now_str())
+            )
+
+
+async def get_top_requested(limit=15):
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(SearchHitStat).order_by(SearchHitStat.count.desc()).limit(limit)
+        )
+        return res.scalars().all()
+
+
+async def get_top_missing(limit=15):
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(SearchMissStat).order_by(SearchMissStat.count.desc()).limit(limit)
+        )
+        return res.scalars().all()
+
+
+async def get_broadcast_count() -> int:
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(func.count(Broadcast.id)))
+        return res.scalar() or 0
+
+
+async def get_auto_index_count() -> int:
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(func.count(AutoIndex.message_id)))
+        return res.scalar() or 0
+
+
+async def get_dashboard_stats() -> dict:
+    """Live numerical overview for the stats panel."""
+    users = await get_total_users()
+    filters = len(await get_all_filter_keywords())
+    topics = await count_topics()
+    broadcasts = await get_broadcast_count()
+    indexed = await get_auto_index_count()
+
+    # Approximate anime vs movies from catalogue keys + topics
+    kws = await get_all_filter_keywords()
+    movie_keys = sum(1 for k in kws if "movie" in (k or "") or "film" in (k or ""))
+    # series-level-ish: topics, else filters without season/ep noise
+    import re
+    granular = re.compile(r"\bs\d+\b|\be\d+\b|\bseason\b|\bepisode\b|\bmovie\b|\bova\b", re.I)
+    series_filters = sum(1 for k in kws if k and not granular.search(k))
+    anime_count = topics if topics else series_filters
+
+    async with AsyncSessionLocal() as session:
+        hits = (await session.execute(select(func.coalesce(func.sum(SearchHitStat.count), 0)))).scalar() or 0
+        misses = (await session.execute(select(func.coalesce(func.sum(SearchMissStat.count), 0)))).scalar() or 0
+        banned = (await session.execute(
+            select(func.count(User.user_id)).where(User.is_banned == True)  # noqa: E712
+        )).scalar() or 0
+
+    return {
+        "users": users,
+        "banned": banned,
+        "filters": filters,
+        "anime": anime_count,
+        "movies": movie_keys,
+        "topics": topics,
+        "indexed_files": indexed,
+        "broadcasts": broadcasts,
+        "search_hits": int(hits),
+        "search_misses": int(misses),
+    }
+
 
 # Broadcasts
 async def save_broadcast_and_get_id(text: str, sent_by: int) -> int:
@@ -219,14 +392,16 @@ async def save_broadcast_and_get_id(text: str, sent_by: int) -> int:
             return b.id
 
 async def save_sent_broadcast_message(broadcast_id: int, user_id: int, message_id: int):
+    insert = _dialect_insert()
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            stmt = insert(BroadcastSentMessage).values(broadcast_id=broadcast_id, user_id=user_id, message_id=message_id)
-            if engine.dialect.name == 'postgresql':
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['broadcast_id', 'user_id'],
-                    set_=dict(message_id=message_id)
-                )
+            stmt = insert(BroadcastSentMessage).values(
+                broadcast_id=broadcast_id, user_id=user_id, message_id=message_id
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['broadcast_id', 'user_id'],
+                set_=dict(message_id=message_id),
+            )
             await session.execute(stmt)
 
 async def get_broadcasts(page: int, per_page: int):
@@ -260,14 +435,19 @@ async def get_sent_broadcast_messages(bid: int):
 
 # Auto Index
 async def add_auto_index(message_id: int, file_name: str, caption: str, message_url: str):
+    insert = _dialect_insert()
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            stmt = insert(AutoIndex).values(message_id=message_id, file_name=file_name, caption=caption, message_url=message_url)
-            if engine.dialect.name == 'postgresql':
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['message_id'],
-                    set_=dict(file_name=file_name, caption=caption, message_url=message_url)
-                )
+            stmt = insert(AutoIndex).values(
+                message_id=message_id,
+                file_name=file_name,
+                caption=caption,
+                message_url=message_url,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['message_id'],
+                set_=dict(file_name=file_name, caption=caption, message_url=message_url),
+            )
             await session.execute(stmt)
 
 async def search_auto_index(query: str):

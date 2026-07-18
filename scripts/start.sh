@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start Telegram bot + admin dashboard (local dev).
+# Local: run Telegram bot only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,30 +13,5 @@ elif [ -d ".venv" ]; then
   source .venv/bin/activate
 fi
 
-echo "Starting Admin Web Dashboard..."
-python -m app.admin.web &
-WEB_PID=$!
-
-echo "Starting Anime Telegram Bot..."
-python -m app.bot &
-BOT_PID=$!
-
-echo ""
-echo "✅ Both services are now running!"
-echo "➡️ Web Dashboard: http://localhost:${PORT:-5000}"
-echo "➡️ Telegram Bot is active."
-echo "Press Ctrl+C to stop both."
-
-cleanup() {
-    echo ""
-    echo "Stopping services..."
-    kill "$WEB_PID" 2>/dev/null || true
-    kill "$BOT_PID" 2>/dev/null || true
-    wait "$WEB_PID" 2>/dev/null || true
-    wait "$BOT_PID" 2>/dev/null || true
-    echo "Services stopped cleanly."
-    exit 0
-}
-
-trap cleanup SIGINT SIGTERM
-wait
+echo "Starting GACO Telegram Bot..."
+exec python -m app.bot

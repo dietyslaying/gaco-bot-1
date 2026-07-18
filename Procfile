@@ -1,1 +1,1 @@
-web: bash scripts/railway-start.sh
+worker: python -m app.bot

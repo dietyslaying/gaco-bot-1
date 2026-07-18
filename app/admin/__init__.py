@@ -1,1 +1,0 @@
-"""Flask admin web dashboard."""

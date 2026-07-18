@@ -1,5 +1,12 @@
 """Rule-based catalogue + cover-server settings (no LLM)."""
 import os
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+except ImportError:
+    pass
 
 # Master switch: auto-refresh filters on new files / covers
 CATALOG_ENABLED = os.getenv("CATALOG_ENABLED", "true").lower() in ("1", "true", "yes", "on")

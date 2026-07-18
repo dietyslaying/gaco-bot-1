@@ -201,30 +201,43 @@ def parse_media(file_name: str, caption: str = "") -> Optional[ParsedMedia]:
         if not text:
             continue
 
+        def _kind_for(blob: str, default: str = "episode") -> str:
+            b = blob.lower()
+            if re.search(r"\b(ova|oav)\b", b):
+                return "ova"
+            if re.search(r"\b(special|tokubetsu)\b", b) or re.search(r"\bsp\d*\b", b):
+                return "special"
+            if re.search(r"\bona\b", b):
+                return "ona"
+            if re.search(r"\b(movie|film|gekijouban)\b", b):
+                return "movie"
+            return default
+
         m = _RE_S_EP_DASH.match(text)
         if m:
             q = quality_hint or _quality_from(m.group("title"))
-            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, "episode")
+            kind = _kind_for(text)
+            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, kind)
 
         m = _RE_BRACKET_S_E.match(text)
         if m:
             q = quality_hint or _quality_from(m.group("title"))
-            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, "episode")
+            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, _kind_for(text))
 
         m = _RE_S_EP_COMPACT.match(text)
         if m:
             q = quality_hint or _quality_from(m.group("title"))
-            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, "episode")
+            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, _kind_for(text))
 
         m = _RE_TITLE_S_EP.match(text)
         if m:
             q = quality_hint or _quality_from(m.group("rest"), m.group("title"))
-            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, "episode")
+            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, _kind_for(text))
 
         m = _RE_TITLE_SXXEXX.match(text)
         if m:
             q = quality_hint or _quality_from(m.group("rest"), m.group("title"))
-            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, "episode")
+            return _finish(m.group("title"), int(m.group("season")), int(m.group("episode")), q, _kind_for(text))
 
     # Movie / free-form fallback: caption title preferred, else cleaned filename
     raw_title = cap_title
@@ -237,4 +250,12 @@ def parse_media(file_name: str, caption: str = "") -> Optional[ParsedMedia]:
     if not raw_title:
         return None
 
-    return _finish(raw_title, None, None, quality_hint, "movie")
+    blob = f"{file_name or ''} {caption or ''} {raw_title}"
+    kind = "movie"
+    if re.search(r"\b(ova|oav)\b", blob, re.I):
+        kind = "ova"
+    elif re.search(r"\b(special|tokubetsu)\b", blob, re.I) or re.search(r"\bsp\d*\b", blob, re.I):
+        kind = "special"
+    elif re.search(r"\bona\b", blob, re.I):
+        kind = "ona"
+    return _finish(raw_title, None, None, quality_hint, kind)
