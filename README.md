@@ -22,28 +22,39 @@ scripts/
   railway-start.sh       # production: bot only
 ```
 
-## Always-on deploy (Railway)
+## Always-on deploy (Alwaysdata SSH)
 
-1. Push this repo to GitHub (already: `dietyslaying/gaco-bot-1`).
-2. [Railway](https://railway.app) → **New Project** → **Deploy from GitHub** → this repo.
-3. **Add Postgres** plugin → Railway sets `DATABASE_URL` (use Postgres in production, not SQLite).
-4. Set variables (Variables tab):
+The bot must run **on the server**, not your laptop.
 
-| Variable | Required |
-|----------|----------|
-| `BOT_TOKEN` | yes |
-| `FILES_GROUP_ID` | yes |
-| `REQUEST_GROUP_ID` / `REQUEST_GROUP_URL` | yes |
-| `ADMINS` | yes (comma-separated Telegram user IDs) |
-| `DATABASE_URL` | yes (from Postgres plugin) |
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_SESSION` | for `/catalog backfill` |
-| `COVER_STORAGE_CHAT_ID` | optional (defaults to first admin) |
-| `REDIS_URL` | optional |
+### 1. Allow SSH (one-time)
 
-5. Start command is already `python -m app.bot` (`railway.json` / `Procfile` worker).
-6. Deploy → bot polls 24/7. Laptop can be off.
+On [Alwaysdata admin](https://admin.alwaysdata.com/) → **SSH** / **Keys**, add this machine’s public key  
+(or use password SSH once).
 
-**Important:** SQLite on Railway is wiped on redeploy. Use the Postgres plugin.
+Deploy scripts:
+
+```powershell
+# From Windows (repo root), after SSH works:
+.\scripts\deploy-alwaysdata.ps1
+scp .env chad@ssh-chad.alwaysdata.net:~/gaco-bot/.env
+ssh chad@ssh-chad.alwaysdata.net "bash ~/gaco-bot/scripts/alwaysdata/start-bot.sh"
+ssh chad@ssh-chad.alwaysdata.net "bash ~/gaco-bot/scripts/alwaysdata/install-cron.sh"
+```
+
+On the server:
+
+```bash
+bash ~/gaco-bot/scripts/alwaysdata/setup.sh
+# create ~/gaco-bot/.env  (BOT_TOKEN, DATABASE_URL, ADMINS, …)
+bash ~/gaco-bot/scripts/alwaysdata/start-bot.sh
+bash ~/gaco-bot/scripts/alwaysdata/install-cron.sh   # auto-restart every 5 min
+bash ~/gaco-bot/scripts/alwaysdata/status-bot.sh
+```
+
+Use **Postgres** from Alwaysdata’s database product for `DATABASE_URL` when possible  
+(SQLite under `~/gaco-bot/data/` works but is weaker for concurrent use).
+
+Laptop can be off; cron watchdog restarts the bot if it dies.
 
 ## Local run (optional)
 
